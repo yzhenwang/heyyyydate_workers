@@ -12,7 +12,7 @@ compatibility_date = "2024-01-01"
 # R2 Bucket binding
 [[r2_buckets]]
 binding = "IMAGES_BUCKET"
-bucket_name = "heyyyydate-images"
+bucket_name = "character-images"
 # preview_bucket_name = "heyyyydate-images-preview"  # Uncomment for preview environment
 
 # Environment-specific configuration
@@ -20,13 +20,13 @@ bucket_name = "heyyyydate-images"
 name = "heyyyydate-image-delivery-staging"
 [[env.staging.r2_buckets]]
 binding = "IMAGES_BUCKET"
-bucket_name = "heyyyydate-images"
+bucket_name = "character-images"
 
 [env.production]
 name = "heyyyydate-image-delivery"
 [[env.production.r2_buckets]]
 binding = "IMAGES_BUCKET"
-bucket_name = "heyyyydate-images"
+bucket_name = "character-images"
 
 # Routes (uncomment when ready to deploy to custom domain)
 # routes = [
