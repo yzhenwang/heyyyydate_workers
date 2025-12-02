@@ -1,16 +1,21 @@
 /**
  * HeyyyyDate Image Delivery Worker
  *
- * Secure image delivery with blur enforcement for locked images.
+ * Secure image delivery with blur enforcement and image transforms.
  *
  * Features:
  * - JWT token validation for image access
- * - Automatic blur for locked image types
- * - Cloudflare Image Resizing transforms
- * - Caching with proper headers
+ * - Automatic blur for locked images via Cloudflare Image Resizing
+ * - Resize and format transforms (width, height, quality, format)
+ * - Two-layer caching (CF Cache API + R2 transformed bucket)
+ * - Presigned URLs for private R2 access
+ *
+ * Architecture:
+ * - IMAGES_BUCKET: Original images (source of truth)
+ * - TRANSFORMED_IMAGES: Cached transformed versions
  *
  * URL Format:
- *   /{character_card}/{image_type}_{variant}.{ext}?token=JWT&w=WIDTH&h=HEIGHT&q=QUALITY
+ *   /{character_card}/{image_type}_{variant}.{ext}?token=JWT[&w=WIDTH&h=HEIGHT&q=QUALITY&f=FORMAT]
  *
  * Token Claims:
  *   {
@@ -21,13 +26,24 @@
  *     exp: number
  *     iat: number
  *   }
- *
- * If image_type is NOT in unlocked_types, blur=50 is applied.
  */
 
 export interface Env {
   IMAGES_BUCKET: R2Bucket;
+  TRANSFORMED_IMAGES: R2Bucket;
   IMAGE_TOKEN_SECRET: string;
+  R2_ACCESS_KEY_ID: string;
+  R2_SECRET_ACCESS_KEY: string;
+  R2_ACCOUNT_ID?: string;
+  ALLOWED_ORIGINS?: string;
+}
+
+interface TransformOptions {
+  blur?: number;
+  width?: number;
+  height?: number;
+  quality?: number;
+  format?: string;
 }
 
 interface TokenClaims {
@@ -39,31 +55,136 @@ interface TokenClaims {
   iat: number;
 }
 
-// Simple base64url decode (Cloudflare Workers don't have Buffer)
+// Default blur radius for locked images
+const BLUR_RADIUS = 50;
+
+// R2 endpoint format
+const getR2Endpoint = (accountId: string) =>
+  `https://${accountId}.r2.cloudflarestorage.com`;
+
+// ============================================================================
+// AWS Signature V4 Implementation for Presigned URLs
+// ============================================================================
+
+async function hmacSha256(key: ArrayBuffer, message: string): Promise<ArrayBuffer> {
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    key,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  return crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(message));
+}
+
+async function sha256(message: string): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(message));
+  return arrayBufferToHex(hash);
+}
+
+function arrayBufferToHex(buffer: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function getSignatureKey(
+  secretKey: string,
+  dateStamp: string,
+  region: string,
+  service: string
+): Promise<ArrayBuffer> {
+  const kDate = await hmacSha256(new TextEncoder().encode('AWS4' + secretKey), dateStamp);
+  const kRegion = await hmacSha256(kDate, region);
+  const kService = await hmacSha256(kRegion, service);
+  return hmacSha256(kService, 'aws4_request');
+}
+
+async function generatePresignedUrl(
+  accessKeyId: string,
+  secretAccessKey: string,
+  accountId: string,
+  bucket: string,
+  key: string,
+  expiresIn: number = 3600
+): Promise<string> {
+  const region = 'auto';
+  const service = 's3';
+  const host = `${accountId}.r2.cloudflarestorage.com`;
+  const endpoint = `https://${host}`;
+
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const canonicalUri = `/${bucket}/${key}`;
+
+  const queryParams = new URLSearchParams({
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `${accessKeyId}/${credentialScope}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': expiresIn.toString(),
+    'X-Amz-SignedHeaders': 'host',
+  });
+
+  // Sort query parameters
+  queryParams.sort();
+  const canonicalQueryString = queryParams.toString();
+
+  const canonicalHeaders = `host:${host}\n`;
+  const signedHeaders = 'host';
+  const payloadHash = 'UNSIGNED-PAYLOAD';
+
+  const canonicalRequest = [
+    'GET',
+    canonicalUri,
+    canonicalQueryString,
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join('\n');
+
+  const canonicalRequestHash = await sha256(canonicalRequest);
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    canonicalRequestHash,
+  ].join('\n');
+
+  const signingKey = await getSignatureKey(secretAccessKey, dateStamp, region, service);
+  const signatureBuffer = await hmacSha256(signingKey, stringToSign);
+  const signature = arrayBufferToHex(signatureBuffer);
+
+  queryParams.set('X-Amz-Signature', signature);
+
+  return `${endpoint}${canonicalUri}?${queryParams.toString()}`;
+}
+
+// ============================================================================
+// JWT Validation
+// ============================================================================
+
 function base64UrlDecode(str: string): string {
-  // Replace URL-safe characters
   str = str.replace(/-/g, '+').replace(/_/g, '/');
-  // Pad with = to make length multiple of 4
   while (str.length % 4) {
     str += '=';
   }
   return atob(str);
 }
 
-// Parse JWT without full validation (validation done by signature check)
 function parseJwt(token: string): TokenClaims | null {
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
-
-    const payload = JSON.parse(base64UrlDecode(parts[1]));
-    return payload as TokenClaims;
+    return JSON.parse(base64UrlDecode(parts[1])) as TokenClaims;
   } catch {
     return null;
   }
 }
 
-// Verify JWT signature using Web Crypto API
 async function verifyJwt(token: string, secret: string): Promise<TokenClaims | null> {
   try {
     const parts = token.split('.');
@@ -71,35 +192,26 @@ async function verifyJwt(token: string, secret: string): Promise<TokenClaims | n
 
     const [header, payload, signature] = parts;
 
-    // Import the secret key
     const encoder = new TextEncoder();
-    const keyData = encoder.encode(secret);
     const key = await crypto.subtle.importKey(
       'raw',
-      keyData,
+      encoder.encode(secret),
       { name: 'HMAC', hash: 'SHA-256' },
       false,
       ['verify']
     );
 
-    // Verify the signature
     const data = encoder.encode(`${header}.${payload}`);
-    const sig = Uint8Array.from(
-      base64UrlDecode(signature),
-      c => c.charCodeAt(0)
-    );
+    const sig = Uint8Array.from(base64UrlDecode(signature), c => c.charCodeAt(0));
 
     const valid = await crypto.subtle.verify('HMAC', key, sig, data);
     if (!valid) return null;
 
-    // Parse and validate expiration
     const claims = parseJwt(token);
     if (!claims) return null;
 
     const now = Math.floor(Date.now() / 1000);
-    if (claims.exp < now) {
-      return null; // Token expired
-    }
+    if (claims.exp < now) return null;
 
     return claims;
   } catch {
@@ -107,27 +219,22 @@ async function verifyJwt(token: string, secret: string): Promise<TokenClaims | n
   }
 }
 
-// Extract image type from key (e.g., "alex_intellectual/casual_1.png" -> "casual")
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
 function extractImageType(key: string): string | null {
-  // Pattern: {character_card}/{image_type}_{variant}.{ext}
   const match = key.match(/\/([a-z]+)_\d+\.[a-z]+$/i);
   return match ? match[1].toLowerCase() : null;
 }
 
-// Extract character card from key
 function extractCharacterCard(key: string): string | null {
-  // Pattern: {character_card}/{image_type}_{variant}.{ext}
-  // Or: preview/{character_card}/{image_type}_{variant}.{ext}
   const parts = key.split('/');
-  if (parts.length === 2) {
-    return parts[0];
-  } else if (parts.length === 3 && parts[0] === 'preview') {
-    return parts[1];
-  }
+  if (parts.length === 2) return parts[0];
+  if (parts.length === 3 && parts[0] === 'preview') return parts[1];
   return null;
 }
 
-// Get content type from file extension
 function getContentType(key: string): string {
   const ext = key.split('.').pop()?.toLowerCase();
   switch (ext) {
@@ -135,131 +242,296 @@ function getContentType(key: string): string {
     case 'jpg':
     case 'jpeg': return 'image/jpeg';
     case 'webp': return 'image/webp';
+    case 'avif': return 'image/avif';
     case 'gif': return 'image/gif';
     default: return 'application/octet-stream';
   }
 }
 
+function parseTransformOptions(url: URL): TransformOptions {
+  const options: TransformOptions = {};
+
+  const w = url.searchParams.get('w');
+  const h = url.searchParams.get('h');
+  const q = url.searchParams.get('q');
+  const f = url.searchParams.get('f');
+
+  if (w) options.width = parseInt(w);
+  if (h) options.height = parseInt(h);
+  if (q) options.quality = parseInt(q);
+  if (f && ['webp', 'avif', 'jpeg', 'png'].includes(f)) options.format = f;
+
+  return options;
+}
+
+function getCacheKey(imageKey: string, options: TransformOptions, isBlurred: boolean): string {
+  const parts = [imageKey];
+
+  if (isBlurred) parts.push(`blur${BLUR_RADIUS}`);
+  if (options.width) parts.push(`w${options.width}`);
+  if (options.height) parts.push(`h${options.height}`);
+  if (options.quality) parts.push(`q${options.quality}`);
+  if (options.format) parts.push(`f${options.format}`);
+
+  // Replace special chars and join with underscores
+  return parts.join('_').replace(/[^a-zA-Z0-9/_.-]/g, '_');
+}
+
+// ============================================================================
+// CORS Handling
+// ============================================================================
+
+const corsHeaders = {
+  'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+};
+
+function getCorsHeaders(request: Request, env: Env): Record<string, string> {
+  const origin = request.headers.get('Origin') || '';
+  const allowedOrigins = env.ALLOWED_ORIGINS
+    ? env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : ['http://localhost:3000', 'http://localhost:8081', 'https://heyyyydate.com'];
+
+  const isAllowed = allowedOrigins.some(allowed => {
+    if (allowed === '*') return true;
+    if (allowed === origin) return true;
+    if (allowed.startsWith('*.')) {
+      return origin.endsWith(allowed.slice(1));
+    }
+    return false;
+  });
+
+  return {
+    ...corsHeaders,
+    'Access-Control-Allow-Origin': isAllowed ? origin : allowedOrigins[0],
+  };
+}
+
+// ============================================================================
+// Main Worker Handler
+// ============================================================================
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const cors = getCorsHeaders(request, env);
+
+    // Handle CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: cors });
+    }
 
     // Health check endpoint
     if (url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok' }), {
-        headers: { 'Content-Type': 'application/json' },
+      const health: Record<string, unknown> = {
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        images_bucket_configured: !!env.IMAGES_BUCKET,
+        transformed_bucket_configured: !!env.TRANSFORMED_IMAGES,
+        presigned_urls_configured: !!(env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY),
+      };
+
+      if (env.IMAGES_BUCKET) {
+        try {
+          const list = await env.IMAGES_BUCKET.list({ limit: 1 });
+          health.images_bucket_accessible = true;
+          health.images_bucket_count = list.objects.length > 0 ? '1+' : '0';
+        } catch (e) {
+          health.images_bucket_accessible = false;
+          health.images_bucket_error = e instanceof Error ? e.message : 'Unknown error';
+          health.status = 'degraded';
+        }
+      }
+
+      if (env.TRANSFORMED_IMAGES) {
+        try {
+          const list = await env.TRANSFORMED_IMAGES.list({ limit: 1 });
+          health.transformed_bucket_accessible = true;
+          health.transformed_bucket_count = list.objects.length > 0 ? '1+' : '0';
+        } catch (e) {
+          health.transformed_bucket_accessible = false;
+          health.transformed_bucket_error = e instanceof Error ? e.message : 'Unknown error';
+          health.status = 'degraded';
+        }
+      }
+
+      return new Response(JSON.stringify(health, null, 2), {
+        headers: { 'Content-Type': 'application/json', ...cors },
       });
     }
 
-    // Get the image key from the path (remove leading /)
+    // Get image key from path
     const imageKey = url.pathname.slice(1);
     if (!imageKey) {
-      return new Response('Not Found', { status: 404 });
+      return new Response('Not Found', { status: 404, headers: cors });
     }
 
-    // Get token from query params
+    // Validate token
     const token = url.searchParams.get('token');
     if (!token) {
-      return new Response('Unauthorized: Missing token', { status: 401 });
+      return new Response('Unauthorized: Missing token', { status: 401, headers: cors });
     }
 
-    // Verify token
     const claims = await verifyJwt(token, env.IMAGE_TOKEN_SECRET);
     if (!claims) {
-      return new Response('Unauthorized: Invalid or expired token', { status: 401 });
+      return new Response('Unauthorized: Invalid or expired token', { status: 401, headers: cors });
     }
 
-    // Validate character_card matches the requested image
+    // Validate character access
     const requestedCard = extractCharacterCard(imageKey);
     if (requestedCard && requestedCard !== claims.character_card) {
-      return new Response('Forbidden: Token not valid for this character', { status: 403 });
+      return new Response('Forbidden: Token not valid for this character', { status: 403, headers: cors });
     }
 
-    // Get image from R2
-    const object = await env.IMAGES_BUCKET.get(imageKey);
-    if (!object) {
-      return new Response('Not Found', { status: 404 });
+    // Check if image exists
+    const originalExists = await env.IMAGES_BUCKET.head(imageKey);
+    if (!originalExists) {
+      return new Response('Not Found', { status: 404, headers: cors });
     }
 
-    // Determine if blur should be applied
+    // Determine blur and transform options
     const imageType = extractImageType(imageKey);
     const isUnlocked = imageType ? claims.unlocked_types.includes(imageType) : true;
+    const shouldBlur = !isUnlocked;
 
-    // Get transform options from query params
-    const width = url.searchParams.get('w');
-    const height = url.searchParams.get('h');
-    const quality = url.searchParams.get('q');
+    const transformOptions = parseTransformOptions(url);
+    const needsTransform = shouldBlur || Object.keys(transformOptions).length > 0;
 
-    // Build response headers
+    // Build cache key
+    const cacheKey = getCacheKey(imageKey, transformOptions, shouldBlur);
+
+    // Check Cloudflare Cache API first
+    const cache = caches.default;
+    const cacheUrl = new URL(request.url);
+    cacheUrl.search = ''; // Remove query params for cache key
+    cacheUrl.pathname = '/' + cacheKey;
+
+    const cachedResponse = await cache.match(cacheUrl.toString());
+    if (cachedResponse) {
+      const headers = new Headers(cachedResponse.headers);
+      headers.set('X-Cache', 'HIT');
+      headers.set('X-Image-Blurred', shouldBlur ? 'true' : 'false');
+      for (const [key, value] of Object.entries(cors)) {
+        headers.set(key, value);
+      }
+      return new Response(cachedResponse.body, { headers });
+    }
+
+    // Check R2 transformed cache
+    if (needsTransform) {
+      const transformedObject = await env.TRANSFORMED_IMAGES.get(cacheKey);
+      if (transformedObject) {
+        const headers = new Headers();
+        headers.set('Content-Type', transformedObject.httpMetadata?.contentType || getContentType(imageKey));
+        headers.set('Cache-Control', 'public, max-age=31536000');
+        headers.set('ETag', transformedObject.httpEtag);
+        headers.set('X-Cache', 'HIT-R2');
+        headers.set('X-Image-Blurred', shouldBlur ? 'true' : 'false');
+        for (const [key, value] of Object.entries(cors)) {
+          headers.set(key, value);
+        }
+
+        const response = new Response(transformedObject.body, { headers });
+
+        // Store in CF Cache
+        await cache.put(cacheUrl.toString(), response.clone());
+
+        return response;
+      }
+    }
+
+    // No cached version - need to fetch/transform
+    if (needsTransform && env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY) {
+      // Generate presigned URL for the original image
+      const accountId = env.R2_ACCOUNT_ID || env.R2_ACCESS_KEY_ID.split('/')[0] || '';
+
+      // We need the account ID - try to extract from access key or use a default
+      // For R2, we can construct the URL differently
+      const presignedUrl = await generatePresignedUrl(
+        env.R2_ACCESS_KEY_ID,
+        env.R2_SECRET_ACCESS_KEY,
+        accountId,
+        'character-images',
+        imageKey,
+        300 // 5 minute expiry for internal use
+      );
+
+      // Build Cloudflare Image Resizing options
+      const cfImageOptions: Record<string, unknown> = {};
+      if (shouldBlur) cfImageOptions.blur = BLUR_RADIUS;
+      if (transformOptions.width) cfImageOptions.width = transformOptions.width;
+      if (transformOptions.height) cfImageOptions.height = transformOptions.height;
+      if (transformOptions.quality) cfImageOptions.quality = transformOptions.quality;
+      if (transformOptions.format) cfImageOptions.format = transformOptions.format;
+
+      // Auto-detect best format from Accept header
+      if (!cfImageOptions.format) {
+        const accept = request.headers.get('Accept') || '';
+        if (accept.includes('image/avif')) {
+          cfImageOptions.format = 'avif';
+        } else if (accept.includes('image/webp')) {
+          cfImageOptions.format = 'webp';
+        }
+      }
+
+      try {
+        const transformedResponse = await fetch(presignedUrl, {
+          cf: { image: cfImageOptions },
+        } as RequestInit);
+
+        if (transformedResponse.ok) {
+          const blob = await transformedResponse.blob();
+
+          // Store in R2 transformed cache
+          await env.TRANSFORMED_IMAGES.put(cacheKey, blob, {
+            httpMetadata: { contentType: blob.type },
+          });
+
+          const headers = new Headers();
+          headers.set('Content-Type', blob.type);
+          headers.set('Cache-Control', 'public, max-age=31536000');
+          headers.set('X-Cache', 'MISS');
+          headers.set('X-Image-Blurred', shouldBlur ? 'true' : 'false');
+          for (const [key, value] of Object.entries(cors)) {
+            headers.set(key, value);
+          }
+
+          const response = new Response(blob.stream(), { headers });
+
+          // Store in CF Cache
+          await cache.put(cacheUrl.toString(), response.clone());
+
+          return response;
+        } else {
+          console.error(`Transform failed: ${transformedResponse.status} ${transformedResponse.statusText}`);
+          // Fall through to serve original
+        }
+      } catch (e) {
+        console.error('Transform error:', e);
+        // Fall through to serve original
+      }
+    }
+
+    // Fallback: serve original from R2 (no transforms)
+    const object = await env.IMAGES_BUCKET.get(imageKey);
+    if (!object) {
+      return new Response('Not Found', { status: 404, headers: cors });
+    }
+
     const headers = new Headers();
     headers.set('Content-Type', object.httpMetadata?.contentType || getContentType(imageKey));
-    headers.set('Cache-Control', 'public, max-age=31536000'); // 1 year
+    headers.set('Cache-Control', 'public, max-age=31536000');
     headers.set('ETag', object.httpEtag);
-
-    // If image is locked, we need to apply blur
-    // Using Cloudflare Image Resizing (requires Workers Paid plan)
-    if (!isUnlocked) {
-      // Apply blur transform via cf property
-      const transformOptions: RequestInitCfProperties = {
-        image: {
-          blur: 50,
-          ...(width && { width: parseInt(width) }),
-          ...(height && { height: parseInt(height) }),
-          ...(quality && { quality: parseInt(quality) }),
-        },
-      };
-
-      // Fetch the image with transforms
-      // Note: This requires the image to be accessible via a URL
-      // In production, you'd configure R2 with a custom domain
-      const imageUrl = `https://${url.hostname}/${imageKey}`;
-
-      try {
-        const transformedResponse = await fetch(imageUrl, {
-          cf: transformOptions,
-        } as RequestInit);
-
-        // Return transformed image
-        return new Response(transformedResponse.body, {
-          headers: {
-            ...Object.fromEntries(headers),
-            'X-Image-Blurred': 'true',
-          },
-        });
-      } catch {
-        // If transform fails, serve original with blur header
-        // (fallback for development/testing)
-        headers.set('X-Image-Blurred', 'true');
-        headers.set('X-Blur-Fallback', 'true');
-        return new Response(object.body, { headers });
-      }
+    headers.set('X-Cache', 'BYPASS');
+    headers.set('X-Image-Blurred', 'false');
+    if (shouldBlur) {
+      headers.set('X-Blur-Fallback', 'true'); // Indicate blur was requested but couldn't be applied
+    }
+    for (const [key, value] of Object.entries(cors)) {
+      headers.set(key, value);
     }
 
-    // Apply resize transforms if requested (for unlocked images)
-    if (width || height || quality) {
-      const transformOptions: RequestInitCfProperties = {
-        image: {
-          ...(width && { width: parseInt(width) }),
-          ...(height && { height: parseInt(height) }),
-          ...(quality && { quality: parseInt(quality) }),
-        },
-      };
-
-      const imageUrl = `https://${url.hostname}/${imageKey}`;
-
-      try {
-        const transformedResponse = await fetch(imageUrl, {
-          cf: transformOptions,
-        } as RequestInit);
-
-        return new Response(transformedResponse.body, { headers });
-      } catch {
-        // Fallback to original if transform fails
-        return new Response(object.body, { headers });
-      }
-    }
-
-    // Return original image (unlocked, no transforms)
     return new Response(object.body, { headers });
   },
 };

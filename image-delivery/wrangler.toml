@@ -6,14 +6,20 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 # Environment variables (set via wrangler secret put)
-# IMAGE_TOKEN_SECRET - JWT secret for verifying image tokens
-# R2_BUCKET_NAME - R2 bucket name
+# IMAGE_TOKEN_SECRET - JWT secret for verifying image tokens (REQUIRED)
+# R2_ACCESS_KEY_ID - R2 access key for generating presigned URLs (REQUIRED)
+# R2_SECRET_ACCESS_KEY - R2 secret key for generating presigned URLs (REQUIRED)
 
-# R2 Bucket binding
+# R2 Bucket bindings
+# Original images (source of truth)
 [[r2_buckets]]
 binding = "IMAGES_BUCKET"
 bucket_name = "character-images"
-# preview_bucket_name = "heyyyydate-images-preview"  # Uncomment for preview environment
+
+# Cached transformed images (blur, resize, format conversions)
+[[r2_buckets]]
+binding = "TRANSFORMED_IMAGES"
+bucket_name = "character-images-transformed"
 
 # Environment-specific configuration
 [env.staging]
@@ -21,12 +27,18 @@ name = "heyyyydate-image-delivery-staging"
 [[env.staging.r2_buckets]]
 binding = "IMAGES_BUCKET"
 bucket_name = "character-images"
+[[env.staging.r2_buckets]]
+binding = "TRANSFORMED_IMAGES"
+bucket_name = "character-images-transformed"
 
 [env.production]
 name = "heyyyydate-image-delivery"
 [[env.production.r2_buckets]]
 binding = "IMAGES_BUCKET"
 bucket_name = "character-images"
+[[env.production.r2_buckets]]
+binding = "TRANSFORMED_IMAGES"
+bucket_name = "character-images-transformed"
 
 # Routes (uncomment when ready to deploy to custom domain)
 # routes = [
