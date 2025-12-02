@@ -291,7 +291,7 @@ function getCorsHeaders(request: Request, env: Env): Record<string, string> {
   const origin = request.headers.get('Origin') || '';
   const allowedOrigins = env.ALLOWED_ORIGINS
     ? env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-    : ['http://localhost:3000', 'http://localhost:8081', 'https://heyyyydate.com'];
+    : ['http://localhost:3000', 'http://localhost:8000', 'http://localhost:8081', 'https://heyyyydate.com'];
 
   const isAllowed = allowedOrigins.some(allowed => {
     if (allowed === '*') return true;
@@ -379,8 +379,9 @@ export default {
     }
 
     // Validate character access
+    // Allow empty character_card (admin tokens) to access all characters
     const requestedCard = extractCharacterCard(imageKey);
-    if (requestedCard && requestedCard !== claims.character_card) {
+    if (requestedCard && claims.character_card && requestedCard !== claims.character_card) {
       return new Response('Forbidden: Token not valid for this character', { status: 403, headers: cors });
     }
 
