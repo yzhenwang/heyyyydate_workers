@@ -66,7 +66,7 @@ const getR2Endpoint = (accountId: string) =>
 // AWS Signature V4 Implementation for Presigned URLs
 // ============================================================================
 
-async function hmacSha256(key: ArrayBuffer, message: string): Promise<ArrayBuffer> {
+async function hmacSha256(key: ArrayBuffer | Uint8Array, message: string): Promise<ArrayBuffer> {
   const cryptoKey = await crypto.subtle.importKey(
     'raw',
     key,
@@ -505,15 +505,38 @@ export default {
           return response;
         } else {
           console.error(`Transform failed: ${transformedResponse.status} ${transformedResponse.statusText}`);
-          // Fall through to serve original
+          // SECURITY: If blur was required, don't serve unblurred original
+          if (shouldBlur) {
+            return new Response('Image processing failed for locked content', {
+              status: 500,
+              headers: { 'Content-Type': 'text/plain', ...cors },
+            });
+          }
+          // Fall through to serve original only if blur was NOT required
         }
       } catch (e) {
         console.error('Transform error:', e);
-        // Fall through to serve original
+        // SECURITY: If blur was required, don't serve unblurred original
+        if (shouldBlur) {
+          return new Response('Image processing failed for locked content', {
+            status: 500,
+            headers: { 'Content-Type': 'text/plain', ...cors },
+          });
+        }
+        // Fall through to serve original only if blur was NOT required
       }
     }
 
-    // Fallback: serve original from R2 (no transforms)
+    // SECURITY CHECK: Never serve unblurred original if blur was required
+    if (shouldBlur) {
+      console.error('Security: Refusing to serve unblurred image when blur was required');
+      return new Response('Image processing unavailable for locked content', {
+        status: 500,
+        headers: { 'Content-Type': 'text/plain', ...cors },
+      });
+    }
+
+    // Fallback: serve original from R2 (only for unlocked images with no transforms)
     const object = await env.IMAGES_BUCKET.get(imageKey);
     if (!object) {
       return new Response('Not Found', { status: 404, headers: cors });
@@ -525,9 +548,6 @@ export default {
     headers.set('ETag', object.httpEtag);
     headers.set('X-Cache', 'BYPASS');
     headers.set('X-Image-Blurred', 'false');
-    if (shouldBlur) {
-      headers.set('X-Blur-Fallback', 'true'); // Indicate blur was requested but couldn't be applied
-    }
     for (const [key, value] of Object.entries(cors)) {
       headers.set(key, value);
     }
