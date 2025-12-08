@@ -3,9 +3,14 @@
  *
  * Secure image delivery with blur enforcement and image transforms.
  *
+ * Architecture: Per-image tokens (Option A)
+ * - Each image URL has its own token with a simple blur flag
+ * - Backend decides what should be blurred, Worker just enforces
+ * - Worker is a "dumb enforcer" - no unlock logic needed
+ *
  * Features:
  * - JWT token validation for image access
- * - Automatic blur for locked images via Cloudflare Image Resizing
+ * - Blur enforcement based on token's "blur" flag
  * - Resize and format transforms (width, height, quality, format)
  * - Two-layer caching (CF Cache API + R2 transformed bucket)
  * - Presigned URLs for private R2 access
@@ -15,14 +20,12 @@
  * - TRANSFORMED_IMAGES: Cached transformed versions
  *
  * URL Format:
- *   /{character_card}/{image_type}_{variant}.{ext}?token=JWT[&w=WIDTH&h=HEIGHT&q=QUALITY&f=FORMAT]
+ *   /{image_key}?token=JWT[&w=WIDTH&h=HEIGHT&q=QUALITY&f=FORMAT]
  *
- * Token Claims:
+ * Token Claims (simple - backend decides blur):
  *   {
- *     user_id: string
- *     character_card: string
- *     unlocked_types: string[]  // e.g., ["profile", "casual"]
- *     relationship_level: number
+ *     image_key: string    // e.g., "alex_intellectual/casual_1.png"
+ *     blur: boolean        // Backend's decision: should this image be blurred?
  *     exp: number
  *     iat: number
  *   }
@@ -47,10 +50,8 @@ interface TransformOptions {
 }
 
 interface TokenClaims {
-  user_id: string;
-  character_card: string;
-  unlocked_types: string[];
-  relationship_level: number;
+  image_key: string;
+  blur: boolean;
   exp: number;
   iat: number;
 }
@@ -223,18 +224,6 @@ async function verifyJwt(token: string, secret: string): Promise<TokenClaims | n
 // Utility Functions
 // ============================================================================
 
-function extractImageType(key: string): string | null {
-  const match = key.match(/\/([a-z]+)_\d+\.[a-z]+$/i);
-  return match ? match[1].toLowerCase() : null;
-}
-
-function extractCharacterCard(key: string): string | null {
-  const parts = key.split('/');
-  if (parts.length === 2) return parts[0];
-  if (parts.length === 3 && parts[0] === 'preview') return parts[1];
-  return null;
-}
-
 function getContentType(key: string): string {
   const ext = key.split('.').pop()?.toLowerCase();
   switch (ext) {
@@ -378,11 +367,10 @@ export default {
       return new Response('Unauthorized: Invalid or expired token', { status: 401, headers: cors });
     }
 
-    // Validate character access
-    // Allow empty character_card (admin tokens) to access all characters
-    const requestedCard = extractCharacterCard(imageKey);
-    if (requestedCard && claims.character_card && requestedCard !== claims.character_card) {
-      return new Response('Forbidden: Token not valid for this character', { status: 403, headers: cors });
+    // Validate image_key matches what's in the token
+    // This prevents token reuse for different images
+    if (claims.image_key && claims.image_key !== imageKey) {
+      return new Response('Forbidden: Token not valid for this image', { status: 403, headers: cors });
     }
 
     // Check if image exists
@@ -391,10 +379,9 @@ export default {
       return new Response('Not Found', { status: 404, headers: cors });
     }
 
-    // Determine blur and transform options
-    const imageType = extractImageType(imageKey);
-    const isUnlocked = imageType ? claims.unlocked_types.includes(imageType) : true;
-    const shouldBlur = !isUnlocked;
+    // Read blur decision directly from token - backend already decided
+    // No unlock logic here - Worker is just an enforcer
+    const shouldBlur = claims.blur === true;
 
     const transformOptions = parseTransformOptions(url);
     const needsTransform = shouldBlur || Object.keys(transformOptions).length > 0;
