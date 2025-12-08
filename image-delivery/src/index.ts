@@ -52,6 +52,7 @@ interface TransformOptions {
 interface TokenClaims {
   image_key: string;
   blur: boolean;
+  user_id?: string;  // Optional for backwards compatibility
   exp: number;
   iat: number;
 }
