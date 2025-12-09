@@ -32,7 +32,8 @@
  */
 
 export interface Env {
-  IMAGES_BUCKET: R2Bucket;
+  IMAGES_BUCKET: R2Bucket;           // Character images (AI-generated)
+  USER_IMAGES_BUCKET: R2Bucket;      // User-uploaded images
   TRANSFORMED_IMAGES: R2Bucket;
   IMAGE_TOKEN_SECRET: string;
   R2_ACCESS_KEY_ID: string;
@@ -268,6 +269,20 @@ function getCacheKey(imageKey: string, options: TransformOptions, isBlurred: boo
 }
 
 // ============================================================================
+// Bucket Selection
+// ============================================================================
+
+function getSourceBucket(env: Env, imageKey: string): R2Bucket {
+  // User-uploaded images: user-images/{user_id}/{image_id}.jpg
+  if (imageKey.startsWith('user-images/')) {
+    return env.USER_IMAGES_BUCKET;
+  }
+
+  // Character images: {character_id}/{category}/{image_name}.png
+  return env.IMAGES_BUCKET;
+}
+
+// ============================================================================
 // CORS Handling
 // ============================================================================
 
@@ -318,6 +333,7 @@ export default {
         status: 'ok',
         timestamp: new Date().toISOString(),
         images_bucket_configured: !!env.IMAGES_BUCKET,
+        user_images_bucket_configured: !!env.USER_IMAGES_BUCKET,
         transformed_bucket_configured: !!env.TRANSFORMED_IMAGES,
         presigned_urls_configured: !!(env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY),
       };
@@ -330,6 +346,18 @@ export default {
         } catch (e) {
           health.images_bucket_accessible = false;
           health.images_bucket_error = e instanceof Error ? e.message : 'Unknown error';
+          health.status = 'degraded';
+        }
+      }
+
+      if (env.USER_IMAGES_BUCKET) {
+        try {
+          const list = await env.USER_IMAGES_BUCKET.list({ limit: 1 });
+          health.user_images_bucket_accessible = true;
+          health.user_images_bucket_count = list.objects.length > 0 ? '1+' : '0';
+        } catch (e) {
+          health.user_images_bucket_accessible = false;
+          health.user_images_bucket_error = e instanceof Error ? e.message : 'Unknown error';
           health.status = 'degraded';
         }
       }
@@ -374,8 +402,11 @@ export default {
       return new Response('Forbidden: Token not valid for this image', { status: 403, headers: cors });
     }
 
+    // Get source bucket based on image key prefix
+    const sourceBucket = getSourceBucket(env, imageKey);
+
     // Check if image exists
-    const originalExists = await env.IMAGES_BUCKET.head(imageKey);
+    const originalExists = await sourceBucket.head(imageKey);
     if (!originalExists) {
       return new Response('Not Found', { status: 404, headers: cors });
     }
@@ -435,13 +466,14 @@ export default {
       // Generate presigned URL for the original image
       const accountId = env.R2_ACCOUNT_ID || env.R2_ACCESS_KEY_ID.split('/')[0] || '';
 
-      // We need the account ID - try to extract from access key or use a default
-      // For R2, we can construct the URL differently
+      // Determine bucket name based on image key prefix
+      const bucketName = imageKey.startsWith('user-images/') ? 'user-images' : 'character-images';
+
       const presignedUrl = await generatePresignedUrl(
         env.R2_ACCESS_KEY_ID,
         env.R2_SECRET_ACCESS_KEY,
         accountId,
-        'character-images',
+        bucketName,
         imageKey,
         300 // 5 minute expiry for internal use
       );
@@ -526,7 +558,7 @@ export default {
     }
 
     // Fallback: serve original from R2 (only for unlocked images with no transforms)
-    const object = await env.IMAGES_BUCKET.get(imageKey);
+    const object = await sourceBucket.get(imageKey);
     if (!object) {
       return new Response('Not Found', { status: 404, headers: cors });
     }

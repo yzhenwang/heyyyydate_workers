@@ -11,10 +11,15 @@ compatibility_date = "2024-01-01"
 # R2_SECRET_ACCESS_KEY - R2 secret key for generating presigned URLs (REQUIRED)
 
 # R2 Bucket bindings
-# Original images (source of truth)
+# Character images (AI-generated, pre-made)
 [[r2_buckets]]
 binding = "IMAGES_BUCKET"
 bucket_name = "character-images"
+
+# User-uploaded images (avatars, chat photos)
+[[r2_buckets]]
+binding = "USER_IMAGES_BUCKET"
+bucket_name = "user-images"
 
 # Cached transformed images (blur, resize, format conversions)
 [[r2_buckets]]
@@ -28,6 +33,9 @@ name = "heyyyydate-image-delivery-staging"
 binding = "IMAGES_BUCKET"
 bucket_name = "character-images"
 [[env.staging.r2_buckets]]
+binding = "USER_IMAGES_BUCKET"
+bucket_name = "user-images"
+[[env.staging.r2_buckets]]
 binding = "TRANSFORMED_IMAGES"
 bucket_name = "character-images-transformed"
 
@@ -36,6 +44,9 @@ name = "heyyyydate-image-delivery"
 [[env.production.r2_buckets]]
 binding = "IMAGES_BUCKET"
 bucket_name = "character-images"
+[[env.production.r2_buckets]]
+binding = "USER_IMAGES_BUCKET"
+bucket_name = "user-images"
 [[env.production.r2_buckets]]
 binding = "TRANSFORMED_IMAGES"
 bucket_name = "character-images-transformed"
